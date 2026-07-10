@@ -113,6 +113,8 @@ def _make_hermes_provider_class() -> Optional[type]:
     except ImportError:  # pragma: no cover — SDK required in CI
         return None
 
+    auth_flow_locks: dict[str, asyncio.Lock] = {}
+
     class HermesMCPOAuthProvider(OAuthClientProvider):
         """OAuthClientProvider with pre-flow disk-mtime reload.
 
@@ -386,47 +388,49 @@ def _make_hermes_provider_class() -> Optional[type]:
                 )
 
         async def async_auth_flow(self, request):  # type: ignore[override]
-            # Pre-flow hook: ask the manager to refresh from disk if needed.
-            # Any failure here is non-fatal — we just log and proceed with
-            # whatever state the SDK already has.
-            try:
-                await get_manager().invalidate_if_disk_changed(
-                    self._hermes_server_name
-                )
-            except Exception as exc:  # pragma: no cover — defensive
-                logger.debug(
-                    "MCP OAuth '%s': pre-flow disk-watch failed (non-fatal): %s",
-                    self._hermes_server_name, exc,
-                )
+            lock = auth_flow_locks.setdefault(self._hermes_server_name, asyncio.Lock())
+            async with lock:
+                # Pre-flow hook: ask the manager to refresh from disk if needed.
+                # Any failure here is non-fatal — we just log and proceed with
+                # whatever state the SDK already has.
+                try:
+                    await get_manager().invalidate_if_disk_changed(
+                        self._hermes_server_name
+                    )
+                except Exception as exc:  # pragma: no cover — defensive
+                    logger.debug(
+                        "MCP OAuth '%s': pre-flow disk-watch failed (non-fatal): %s",
+                        self._hermes_server_name, exc,
+                    )
 
-            # Manually bridge the bidirectional generator protocol. httpx's
-            # auth_flow driver (httpx._client._send_handling_auth) calls
-            # ``auth_flow.asend(response)`` to feed HTTP responses back into
-            # the generator. A naive wrapper using ``async for item in inner:
-            # yield item`` DISCARDS those .asend(response) values and resumes
-            # the inner generator with None, so the SDK's
-            # ``response = yield request`` branch in
-            # mcp/client/auth/oauth2.py sees response=None and crashes at
-            # ``if response.status_code == 401`` with AttributeError.
-            #
-            # The bridge below forwards each .asend() value into the inner
-            # generator via inner.asend(incoming), preserving the bidirectional
-            # contract. Regression from PR #11383 caught by
-            # tests/tools/test_mcp_oauth_bidirectional.py.
-            inner = super().async_auth_flow(request)
-            try:
-                outgoing = await inner.__anext__()
-                while True:
-                    incoming = yield outgoing
-                    # Sniff the response for a dead-client-registration signal
-                    # before handing it back to the SDK (best-effort, GH#36767).
-                    await self._maybe_flag_poisoned_client(incoming)
-                    outgoing = await inner.asend(incoming)
-            except StopAsyncIteration:
-                # Persist any metadata the SDK discovered lazily during the
-                # 401 branch so a subsequent cold-load skips discovery.
-                self._persist_oauth_metadata_if_changed()
-                return
+                # Manually bridge the bidirectional generator protocol. httpx's
+                # auth_flow driver (httpx._client._send_handling_auth) calls
+                # ``auth_flow.asend(response)`` to feed HTTP responses back into
+                # the generator. A naive wrapper using ``async for item in inner:
+                # yield item`` DISCARDS those .asend(response) values and resumes
+                # the inner generator with None, so the SDK's
+                # ``response = yield request`` branch in
+                # mcp/client/auth/oauth2.py sees response=None and crashes at
+                # ``if response.status_code == 401`` with AttributeError.
+                #
+                # The bridge below forwards each .asend() value into the inner
+                # generator via inner.asend(incoming), preserving the bidirectional
+                # contract. Regression from PR #11383 caught by
+                # tests/tools/test_mcp_oauth_bidirectional.py.
+                inner = super().async_auth_flow(request)
+                try:
+                    outgoing = await inner.__anext__()
+                    while True:
+                        incoming = yield outgoing
+                        # Sniff the response for a dead-client-registration signal
+                        # before handing it back to the SDK (best-effort, GH#36767).
+                        await self._maybe_flag_poisoned_client(incoming)
+                        outgoing = await inner.asend(incoming)
+                except StopAsyncIteration:
+                    # Persist any metadata the SDK discovered lazily during the
+                    # 401 branch so a subsequent cold-load skips discovery.
+                    self._persist_oauth_metadata_if_changed()
+                    return
 
     return HermesMCPOAuthProvider
 
@@ -523,7 +527,7 @@ class MCPOAuthManager:
             _is_interactive,
             _maybe_preregister_client,
             _redirect_handler,
-            _wait_for_callback,
+            _wait_for_callback_on_port,
         )
 
         if not _OAUTH_AVAILABLE:
@@ -541,7 +545,7 @@ class MCPOAuthManager:
                 "authorization."
             )
 
-        _configure_callback_port(cfg)
+        callback_port = _configure_callback_port(cfg, server_name=server_name)
         client_metadata = _build_client_metadata(cfg)
         _maybe_preregister_client(storage, cfg, client_metadata)
 
@@ -552,7 +556,7 @@ class MCPOAuthManager:
             client_metadata=client_metadata,
             storage=storage,
             redirect_handler=_redirect_handler,
-            callback_handler=_wait_for_callback,
+            callback_handler=lambda: _wait_for_callback_on_port(callback_port),
             timeout=float(cfg.get("timeout", 300)),
         )
 

@@ -10884,14 +10884,32 @@ async def auth_mcp_server(name: str, profile: Optional[str] = None):
         )
     cfg["auth"] = "oauth"
 
+    auth_url_event = threading.Event()
+    done_event = threading.Event()
+    auth_url_box: Dict[str, str] = {}
+    result_box: Dict[str, Any] = {}
+
+    def _capture_auth_url(url: str) -> None:
+        if "url" not in auth_url_box:
+            auth_url_box["url"] = url
+            auth_url_event.set()
+
     def _run():
-        from tools.mcp_oauth import HermesTokenStorage, force_interactive_oauth
+        from tools.mcp_oauth import (
+            HermesTokenStorage,
+            capture_authorization_url,
+            force_interactive_oauth,
+        )
 
         # Home-only scope, not _profile_scope: this blocks on the browser flow
         # for up to minutes; holding the shared skills lock that whole time
         # would freeze every other endpoint. Config writes here (_save_mcp_server)
         # resolve HERMES_HOME via the contextvar override, which is all they need.
-        with _config_profile_scope(profile), force_interactive_oauth():
+        with (
+            _config_profile_scope(profile),
+            force_interactive_oauth(),
+            capture_authorization_url(_capture_auth_url),
+        ):
             storage = HermesTokenStorage(name)
             # Snapshot before clearing: a re-auth wipes cached state to force a
             # fresh consent, but if the flow fails we must NOT leave the user
@@ -10936,9 +10954,7 @@ async def auth_mcp_server(name: str, profile: Optional[str] = None):
                 "tools": [{"name": t, "description": d} for t, d in tools],
             }
 
-    try:
-        return await asyncio.to_thread(_run)
-    except Exception as exc:
+    def _format_auth_error(exc: Exception) -> str:
         msg = str(exc)
         # Providers that gate RFC 7591 registration to pre-approved clients
         # (Figma's MCP catalog, etc.) 403 the register call before any
@@ -10953,7 +10969,51 @@ async def auth_mcp_server(name: str, profile: Optional[str] = None):
                 "(oauth: {client_id: ..., client_secret: ...}), or use the "
                 "provider's stdio / API-key server instead."
             )
-        return {"ok": False, "error": msg, "tools": []}
+        return msg
+
+    def _target() -> None:
+        try:
+            result_box["result"] = _run()
+        except Exception as exc:
+            result_box["error"] = _format_auth_error(exc)
+        finally:
+            done_event.set()
+
+    threading.Thread(
+        target=_target,
+        name=f"mcp-auth-{name}",
+        daemon=True,
+    ).start()
+
+    # Remote desktop mode: return the browser URL as soon as the OAuth SDK
+    # asks to redirect, while the worker thread keeps the localhost callback
+    # listener alive on the VPS. The Mac app opens the URL locally; an SSH
+    # tunnel forwards http://127.0.0.1:<port>/callback back to this listener.
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        if auth_url_event.is_set():
+            return {
+                "ok": False,
+                "pending": True,
+                "auth_url": auth_url_box["url"],
+                "error": "OAuth started. Complete the browser authorization window, then reload or test this MCP server.",
+                "tools": [],
+            }
+        if done_event.is_set():
+            if "result" in result_box:
+                return result_box["result"]
+            return {
+                "ok": False,
+                "error": result_box.get("error", "OAuth failed before an authorization URL was produced."),
+                "tools": [],
+            }
+        await asyncio.sleep(0.1)
+
+    return {
+        "ok": False,
+        "error": "OAuth did not produce an authorization URL within 20 seconds. Check MCP logs and retry.",
+        "tools": [],
+    }
 
 
 class MCPEnabledToggle(BaseModel):
