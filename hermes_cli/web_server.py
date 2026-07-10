@@ -10931,55 +10931,6 @@ async def auth_mcp_server(name: str, profile: Optional[str] = None):
                     _cfg_timeout = float(cfg.get("connect_timeout", 0))
                 except (TypeError, ValueError):
                     _cfg_timeout = 0.0
-                if name == "google_chat":
-                    from hermes_cli.mcp_config import _resolve_mcp_server_config
-                    from tools.mcp_tool import _connect_server
-
-                    async def _trigger_google_chat_oauth() -> None:
-                        resolved = _resolve_mcp_server_config(cfg)
-                        server = await _connect_server(name, resolved)
-                        try:
-                            probes = [
-                                (
-                                    "search_messages",
-                                    {
-                                        "searchParameters": {
-                                            "keywords": ["Hermes"],
-                                            "conversationIncludesUser": "steph@hspoints.com",
-                                        },
-                                        "pageSize": 1,
-                                        "orderBy": "CREATE_TIME_DESC",
-                                    },
-                                ),
-                                (
-                                    "search_conversations",
-                                    {
-                                        "participants": ["steph@hspoints.com"],
-                                        "pageSize": 1,
-                                    },
-                                ),
-                            ]
-                            for tool_name, arguments in probes:
-                                result = await server.session.call_tool(
-                                    tool_name, arguments=arguments
-                                )
-                                if _oauth_tokens_present(name):
-                                    return
-                                if getattr(result, "isError", False):
-                                    parts = []
-                                    for block in getattr(result, "content", None) or []:
-                                        block_text = getattr(block, "text", None)
-                                        if block_text:
-                                            parts.append(block_text)
-                                    raise RuntimeError(
-                                        "\n".join(parts)
-                                        or f"MCP tool {tool_name!r} returned an error before OAuth completed"
-                                    )
-                        finally:
-                            await server.shutdown()
-
-                    asyncio.run(_trigger_google_chat_oauth())
-
                 tools = _probe_single_server(
                     name, cfg, connect_timeout=max(_cfg_timeout, 315)
                 )
