@@ -40,6 +40,7 @@ import os
 import re
 import secrets
 import socket
+import zlib
 import stat
 import sys
 import threading
@@ -111,6 +112,14 @@ _oauth_interactive_enabled: "contextvars.ContextVar[bool]" = contextvars.Context
 # discovery must never start a browser flow.
 _oauth_interactive_forced: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
     "_oauth_interactive_forced", default=False
+)
+
+# Optional GUI hook used by the remote dashboard: when OAuth starts on a VPS,
+# the backend cannot open the user's Mac browser itself. The dashboard auth
+# endpoint installs a hook, returns the URL to the desktop app immediately,
+# and leaves the callback listener running in the worker thread.
+_oauth_authorization_url_hook: "contextvars.ContextVar[Any | None]" = contextvars.ContextVar(
+    "_oauth_authorization_url_hook", default=None
 )
 
 
@@ -196,6 +205,16 @@ def force_interactive_oauth():
         yield
     finally:
         _oauth_interactive_forced.reset(token)
+
+
+@contextmanager
+def capture_authorization_url(callback):
+    """Call *callback(url)* when an MCP OAuth authorization URL is generated."""
+    token = _oauth_authorization_url_hook.set(callback)
+    try:
+        yield
+    finally:
+        _oauth_authorization_url_hook.reset(token)
 
 
 @contextmanager
@@ -566,6 +585,13 @@ async def _redirect_handler(authorization_url: str) -> None:
     )
     print(msg, file=sys.stderr)
 
+    hook = _oauth_authorization_url_hook.get()
+    if hook is not None:
+        try:
+            hook(authorization_url)
+        except Exception:
+            logger.debug("OAuth authorization URL hook failed", exc_info=True)
+
     # On a remote SSH session the OAuth provider redirects to
     # http://127.0.0.1:<port>/callback, which reaches the callback server on
     # the *remote* machine — not the user's local machine where the browser
@@ -630,6 +656,18 @@ async def _wait_for_callback() -> tuple[str, str | None]:
             "before _wait_for_oauth_callback"
         )
 
+    return await _wait_for_callback_on_port(_oauth_port)
+
+
+async def _wait_for_callback_on_port(callback_port: int) -> tuple[str, str | None]:
+    """Wait for the OAuth callback on an explicit per-flow port.
+
+    The legacy _wait_for_callback() reads a module-level _oauth_port. Remote
+    dashboard reloads can start multiple OAuth MCP flows concurrently (for
+    example Fibery and Google Chat), so the shared global can be overwritten
+    between provider construction and callback binding. Capturing the port per
+    provider avoids cross-server callback bind collisions.
+    """
     # Reject before binding the callback listener in non-interactive contexts.
     # Reaching here means the SDK entered the authorization-code flow (a valid
     # or refreshable token would never call the callback handler), so a cached
@@ -646,22 +684,45 @@ async def _wait_for_callback() -> tuple[str, str | None]:
         "authorization without binding a callback listener."
     )
 
-    # The callback server is already running (started in build_oauth_auth).
-    # We just need to poll for the result.
     handler_cls, result = _make_callback_handler()
 
-    # Start a temporary server on the known port
+    # Bind the callback listener on the resolved port. build_oauth_auth only
+    # *reserves* a port number (via _configure_callback_port); it does not
+    # start a server. So a bind failure here means another OAuth flow for this
+    # server already owns the port — typically a concurrent initial-connect
+    # retry reusing the same stable per-server port. Report the real cause
+    # (EADDRINUSE); this is an immediate bind failure, not a timeout — no wait
+    # has happened yet.
     try:
-        server = HTTPServer(("127.0.0.1", _oauth_port), handler_cls)
-    except OSError:
-        # Port already in use — the server from build_oauth_auth is running.
-        # Fall back to polling the server started by build_oauth_auth.
+        server = HTTPServer(("127.0.0.1", callback_port), handler_cls)
+    except OSError as exc:
         raise OAuthNonInteractiveError(
-            "OAuth callback timed out — could not bind callback port. "
-            "Complete the authorization in a browser first, then retry."
-        )
+            f"OAuth callback port {callback_port} is already in use by another "
+            "authorization attempt for this server; not starting a second flow. "
+            "Let the in-progress authorization finish, then retry."
+        ) from exc
 
-    server_thread = threading.Thread(target=server.handle_request, daemon=True)
+    # Keep the callback listener alive until the real OAuth result arrives.
+    # A reverse proxy/Tailscale Serve probe can otherwise consume the single
+    # handle_request() call before the browser redirects with code=..., leaving
+    # the real callback with a 502 even though auth is still pending.
+    server.timeout = 0.5
+    stop_event = threading.Event()
+
+    def _serve_callback_until_result() -> None:
+        while not stop_event.is_set():
+            if result["auth_code"] is not None or result["error"] is not None:
+                break
+            try:
+                server.handle_request()
+            except OSError:
+                break
+
+    server_thread = threading.Thread(
+        target=_serve_callback_until_result,
+        name=f"mcp-oauth-callback-{callback_port}",
+        daemon=True,
+    )
     server_thread.start()
 
     # Optional paste-fallback thread: only on interactive TTYs. Reads one
@@ -692,6 +753,7 @@ async def _wait_for_callback() -> tuple[str, str | None]:
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
     finally:
+        stop_event.set()
         server.server_close()
 
     if result["error"] == _USER_SKIPPED_SENTINEL:
@@ -812,7 +874,7 @@ def remove_oauth_tokens(server_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _configure_callback_port(cfg: dict) -> int:
+def _configure_callback_port(cfg: dict, server_name: str | None = None) -> int:
     """Pick or validate the OAuth callback port.
 
     Stores the resolved port into ``cfg['_resolved_port']`` so sibling
@@ -827,11 +889,32 @@ def _configure_callback_port(cfg: dict) -> int:
     """
     global _oauth_port
     requested = int(cfg.get("redirect_port", 0))
+    if requested == 0 and server_name:
+        # Remote desktop/dashboard OAuth needs a predictable loopback port so
+        # the Mac can keep a matching SSH -L tunnel open before auth starts.
+        # Use a stable per-server slot unless config.yaml explicitly provides
+        # oauth.redirect_port. This also avoids concurrent unauthenticated MCP
+        # servers racing onto one module-level callback port.
+        base = int(os.environ.get("HERMES_MCP_OAUTH_REDIRECT_BASE_PORT", "47000"))
+        span = int(os.environ.get("HERMES_MCP_OAUTH_REDIRECT_PORT_SPAN", "1000"))
+        requested = base + (zlib.crc32(_safe_filename(server_name).encode("utf-8")) % max(span, 1))
     port = _find_free_port() if requested == 0 else requested
     cfg["_resolved_port"] = port
     _oauth_port = port  # legacy consumer: _wait_for_callback reads this
     return port
 
+
+def _oauth_redirect_uri(cfg: dict) -> str:
+    """Return the OAuth redirect URI advertised to the provider."""
+    redirect_uri = cfg.get("redirect_uri")
+    if redirect_uri:
+        return str(redirect_uri)
+    port = cfg.get("_resolved_port")
+    if port is None:
+        raise ValueError(
+            "_configure_callback_port() must be called before building OAuth metadata"
+        )
+    return f"http://127.0.0.1:{port}/callback"
 
 def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
     """Build OAuthClientMetadata from the oauth config dict.
@@ -846,7 +929,7 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
         )
     client_name = cfg.get("client_name", "Hermes Agent")
     scope = cfg.get("scope")
-    redirect_uri = f"http://127.0.0.1:{port}/callback"
+    redirect_uri = _oauth_redirect_uri(cfg)
 
     metadata_kwargs: dict[str, Any] = {
         "client_name": client_name,
@@ -872,8 +955,7 @@ def _maybe_preregister_client(
     client_id = cfg.get("client_id")
     if not client_id:
         return
-    port = cfg["_resolved_port"]
-    redirect_uri = f"http://127.0.0.1:{port}/callback"
+    redirect_uri = _oauth_redirect_uri(cfg)
 
     info_dict: dict[str, Any] = {
         "client_id": client_id,
@@ -934,7 +1016,7 @@ def build_oauth_auth(
             "initial authorization, then cached tokens will be reused."
         )
 
-    _configure_callback_port(cfg)
+    _configure_callback_port(cfg, server_name=server_name)
     client_metadata = _build_client_metadata(cfg)
     _maybe_preregister_client(storage, cfg, client_metadata)
 
@@ -943,6 +1025,6 @@ def build_oauth_auth(
         client_metadata=client_metadata,
         storage=storage,
         redirect_handler=_redirect_handler,
-        callback_handler=_wait_for_callback,
+        callback_handler=lambda: _wait_for_callback_on_port(cfg["_resolved_port"]),
         timeout=float(cfg.get("timeout", 300)),
     )

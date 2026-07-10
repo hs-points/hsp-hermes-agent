@@ -3179,17 +3179,54 @@ def _is_auth_error(exc: BaseException) -> bool:
     ``httpx.HTTPStatusError`` is only treated as auth-related when the
     response status code is 401. Other HTTP errors fall through to the
     generic error path in the tool handlers.
+
+    The MCP SDK runs its HTTP transport inside an anyio TaskGroup, so an OAuth
+    failure raised mid-connect (e.g. ``OAuthFlowError: State parameter
+    mismatch``) reaches ``MCPServerTask.run`` wrapped in a
+    ``BaseExceptionGroup`` ("unhandled errors in a TaskGroup") rather than as
+    the bare error. A flat ``isinstance`` check misses it, so the
+    initial-connect retry loop treats it as a transient failure and rebuilds
+    the transport — launching a *fresh* OAuth authorization with a new
+    ``state`` while the human is still completing the previous one. Each retry
+    (1s/2s/4s backoff) is impossibly faster than a browser round-trip, so the
+    redirect/paste the human eventually completes carries a stale ``state``
+    and fails ``State parameter mismatch``, and tokens are never persisted.
+    That was the interactive ``hermes mcp login`` breakage. Unwrapping the
+    group here lets the loop stop retrying and surface the real auth error, so
+    a single OAuth flow can run to completion. Mirrors
+    ``hermes_cli.mcp_config._unwrap_exception_group``.
     """
     types = _get_auth_error_types()
-    if not types or not isinstance(exc, types):
+    if not types:
         return False
-    try:
-        import httpx
-        if isinstance(exc, httpx.HTTPStatusError):
-            return getattr(exc.response, "status_code", None) == 401
-    except ImportError:
-        pass
-    return True
+
+    def _leaf_is_auth(e: BaseException) -> bool:
+        if not isinstance(e, types):
+            return False
+        try:
+            import httpx
+            if isinstance(e, httpx.HTTPStatusError):
+                return getattr(e.response, "status_code", None) == 401
+        except ImportError:
+            pass
+        return True
+
+    # Walk anyio/ExceptionGroup members (a TaskGroup may aggregate several
+    # sub-exceptions); a bare exception has no ``exceptions`` attribute and is
+    # checked directly. The ``seen`` bound is a defensive cap against a
+    # pathological/cyclic group graph.
+    stack: list[BaseException] = [exc]
+    seen = 0
+    while stack and seen < 100:
+        seen += 1
+        current = stack.pop()
+        nested = getattr(current, "exceptions", None)
+        if nested:
+            stack.extend(nested)
+            continue
+        if _leaf_is_auth(current):
+            return True
+    return False
 
 
 def _handle_auth_error_and_retry(
