@@ -980,8 +980,44 @@ def _load_global_auth_store() -> Dict[str, Any]:
         return {}
 
 
-def _auth_lock_path() -> Path:
-    return _auth_file_path().with_suffix(".lock")
+def _shared_auth_target(auth_file: Path) -> Optional[Path]:
+    """Return the real target when ``auth_file`` is a shared auth symlink.
+
+    A symlink is treated as shared when its existing target is owned by a
+    different uid or deliberately grants group/other write access. Those
+    targets cannot be replaced with Hermes' usual owner-only tempfile:
+    doing so changes the inode owner to the current user and strands every
+    other account that consumes the shared credential store.
+    """
+    try:
+        if not auth_file.is_symlink():
+            return None
+        target = auth_file.resolve(strict=True)
+        target_stat = target.stat()
+        if not stat.S_ISREG(target_stat.st_mode):
+            return None
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else target_stat.st_uid
+        shared_write_bits = stat.S_IWGRP | stat.S_IWOTH
+        if target_stat.st_uid != current_uid or target_stat.st_mode & shared_write_bits:
+            return target
+    except OSError:
+        return None
+    return None
+
+
+def _auth_lock_path(auth_file: Optional[Path] = None) -> Path:
+    """Return a lock visible to every process that uses this auth store.
+
+    Private stores keep the historical sibling ``auth.lock``. Shared
+    symlink stores lock the stable target inode itself, avoiding a per-user
+    lock under each consumer's ``~/.hermes`` and avoiding a separately
+    provisioned lock file in the managed directory.
+    """
+    auth_file = auth_file or _auth_file_path()
+    shared_target = _shared_auth_target(auth_file)
+    if shared_target is not None:
+        return shared_target
+    return auth_file.with_suffix(".lock")
 
 
 _auth_lock_holder = threading.local()
@@ -996,29 +1032,39 @@ def _file_lock(
 ):
     """Cross-process advisory flock helper.
 
-    Reentrant per-thread via ``holder.depth``. Falls back to a depth-only
-    guard when neither ``fcntl`` nor ``msvcrt`` is available (rare).
+    Reentrant per-thread and per canonical lock path. Falls back to a
+    path-aware depth guard when neither ``fcntl`` nor ``msvcrt`` is
+    available (rare).
     Callers supply their own ``threading.local`` so independent locks
     (e.g. profile auth.json vs shared Nous store) don't share reentrancy
     state — that would let one lock's reentrant acquisition silently skip
     the other's kernel-level flock.
     """
-    if getattr(holder, "depth", 0) > 0:
-        holder.depth += 1
+    try:
+        lock_key = str(lock_path.resolve(strict=False))
+    except OSError:
+        lock_key = os.path.abspath(str(lock_path))
+    held_paths = getattr(holder, "held_paths", None)
+    if held_paths is None:
+        held_paths = {}
+        holder.held_paths = held_paths
+
+    if held_paths.get(lock_key, 0) > 0:
+        held_paths[lock_key] += 1
         try:
             yield
         finally:
-            holder.depth -= 1
+            held_paths[lock_key] -= 1
         return
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     if fcntl is None and msvcrt is None:
-        holder.depth = 1
+        held_paths[lock_key] = 1
         try:
             yield
         finally:
-            holder.depth = 0
+            held_paths.pop(lock_key, None)
         return
 
     # On Windows, msvcrt.locking needs the file to have content and the
@@ -1041,11 +1087,11 @@ def _file_lock(
                     raise TimeoutError(timeout_message)
                 time.sleep(0.05)
 
-        holder.depth = 1
+        held_paths[lock_key] = 1
         try:
             yield
         finally:
-            holder.depth = 0
+            held_paths.pop(lock_key, None)
             if fcntl:
                 try:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -1060,7 +1106,11 @@ def _file_lock(
 
 
 @contextmanager
-def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
+def _auth_store_lock(
+    timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
+    *,
+    auth_file: Optional[Path] = None,
+):
     """Cross-process advisory lock for auth.json reads+writes.  Reentrant.
 
     Lock ordering invariant: when this lock is held together with
@@ -1070,34 +1120,269 @@ def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
     against a concurrent import on the shared store.
     """
     with _file_lock(
-        _auth_lock_path(),
+        _auth_lock_path(auth_file),
         _auth_lock_holder,
         timeout_seconds,
         "Timed out waiting for auth store lock",
     ):
         yield
 
+_SHARED_AUTH_JOURNAL_ROOT = Path("/var/tmp")
+
+
+def _shared_auth_journal_path(target: Path) -> Path:
+    """Return a journal path writable by every member of the auth group.
+
+    Prefer the managed target directory when it is group-writable. Read-only
+    managed directories use a setgid, group-verified directory in /var/tmp;
+    this keeps the shared target directory non-replaceable by consumers.
+    """
+    filename = f".{target.name}.last-good"
+    if os.access(target.parent, os.W_OK):
+        return target.with_name(filename)
+
+    target_stat = target.stat()
+    journal_dir = _SHARED_AUTH_JOURNAL_ROOT / (
+        f"hermes-shared-auth-{target_stat.st_dev:x}-{target_stat.st_ino:x}"
+    )
+    try:
+        journal_dir.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+
+    directory_stat = journal_dir.lstat()
+    if not stat.S_ISDIR(directory_stat.st_mode):
+        raise PermissionError(f"shared auth journal path is not a directory: {journal_dir}")
+
+    if directory_stat.st_gid != target_stat.st_gid:
+        try:
+            os.chown(journal_dir, -1, target_stat.st_gid)
+        except OSError as exc:
+            raise PermissionError(
+                f"shared auth journal {journal_dir} is not owned by target group "
+                f"{target_stat.st_gid}"
+            ) from exc
+    try:
+        journal_dir.chmod(0o2770)
+    except OSError:
+        pass
+
+    directory_stat = journal_dir.stat()
+    directory_mode = stat.S_IMODE(directory_stat.st_mode)
+    if (
+        directory_stat.st_gid != target_stat.st_gid
+        or directory_mode & 0o007
+        or directory_mode & 0o2070 != 0o2070
+    ):
+        raise PermissionError(
+            f"unsafe shared auth journal directory metadata: {journal_dir} "
+            f"gid={directory_stat.st_gid} mode=0o{directory_mode:o}"
+        )
+    return journal_dir / filename
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    written = 0
+    while written < len(view):
+        count = os.write(fd, view[written:])
+        if count <= 0:
+            raise OSError("short write while persisting shared auth store")
+        written += count
+
+
+def _write_shared_auth_journal(target: Path, payload: bytes) -> None:
+    """Atomically persist a group-readable last-known-good shared payload."""
+    target_stat = target.stat()
+    journal = _shared_auth_journal_path(target)
+    tmp_path = journal.with_name(
+        f"{journal.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+    fd: Optional[int] = None
+    try:
+        fd = os.open(
+            str(tmp_path),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        if hasattr(os, "fchown"):
+            try:
+                os.fchown(fd, -1, target_stat.st_gid)
+            except PermissionError:
+                # A setgid shared directory normally assigned the correct
+                # group at create time. Validate it below before publishing.
+                pass
+        journal_mode = stat.S_IRUSR | stat.S_IWUSR | (
+            stat.S_IMODE(target_stat.st_mode) & (stat.S_IRGRP | stat.S_IWGRP)
+        )
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, journal_mode)
+        created_stat = os.fstat(fd)
+        if created_stat.st_gid != target_stat.st_gid:
+            raise PermissionError(
+                f"shared auth journal group {created_stat.st_gid} does not match "
+                f"target group {target_stat.st_gid}; ensure {journal.parent} is setgid"
+            )
+        _write_all(fd, payload)
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        os.replace(tmp_path, journal)
+        try:
+            dir_fd = os.open(str(journal.parent), os.O_RDONLY)
+        except OSError:
+            dir_fd = None
+        if dir_fd is not None:
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def _write_shared_auth_payload(
+    target: Path,
+    payload: bytes,
+    *,
+    backup_current: bool = True,
+) -> None:
+    """Rewrite a shared auth target in place while preserving its metadata.
+
+    Readers and writers hold an exclusive flock on this same stable inode.
+    The last-known-good journal makes an interrupted in-place write
+    recoverable without replacing the root/group-owned target.
+    """
+    json.loads(payload.decode("utf-8"))
+    flags = os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(str(target), flags)
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode):
+        os.close(fd)
+        raise OSError(f"shared auth target is not a regular file: {target}")
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        current = b"".join(chunks)
+
+        if backup_current and current:
+            try:
+                json.loads(current.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                pass
+            else:
+                # Fail closed before the first destructive write if the
+                # shared recovery journal cannot be provisioned.
+                _write_shared_auth_journal(target, current)
+
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            _write_all(fd, payload)
+            os.ftruncate(fd, len(payload))
+            os.fsync(fd)
+        except BaseException:
+            # Best-effort immediate rollback. The journal remains available
+            # to the next process if this process is terminated mid-write.
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                _write_all(fd, current)
+                os.ftruncate(fd, len(current))
+                os.fsync(fd)
+            except OSError:
+                pass
+            raise
+
+        after = os.fstat(fd)
+        before_metadata = (
+            before.st_dev,
+            before.st_ino,
+            before.st_uid,
+            before.st_gid,
+            stat.S_IMODE(before.st_mode),
+        )
+        after_metadata = (
+            after.st_dev,
+            after.st_ino,
+            after.st_uid,
+            after.st_gid,
+            stat.S_IMODE(after.st_mode),
+        )
+        if after_metadata != before_metadata:
+            raise OSError(
+                f"shared auth metadata changed during in-place write: "
+                f"before={before_metadata}, after={after_metadata}"
+            )
+    finally:
+        os.close(fd)
+
+    # Advance the recovery point only after the durable target write. Failure
+    # here is non-fatal because the primary contains the new valid payload.
+    try:
+        _write_shared_auth_journal(target, payload)
+    except OSError as exc:
+        logger.warning("auth: could not advance shared auth journal %s: %s", target, exc)
+
+
+def _recover_shared_auth_store(target: Path) -> Optional[Dict[str, Any]]:
+    journal = _shared_auth_journal_path(target)
+    try:
+        payload = journal.read_bytes()
+        recovered = json.loads(payload.decode("utf-8"))
+        if not isinstance(recovered, dict):
+            return None
+        _write_shared_auth_payload(target, payload, backup_current=False)
+        logger.warning("auth: recovered interrupted shared auth write from %s", journal)
+        return recovered
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
+    with _auth_store_lock(auth_file=auth_file):
+        return _load_auth_store_unlocked(auth_file)
+
+
+def _load_auth_store_unlocked(auth_file: Path) -> Dict[str, Any]:
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     try:
-        raw = json.loads(auth_file.read_text())
+        raw = json.loads(auth_file.read_text(encoding="utf-8"))
     except Exception as exc:
-        corrupt_path = auth_file.with_suffix(".json.corrupt")
-        try:
-            import shutil
-            shutil.copy2(auth_file, corrupt_path)
-        except Exception:
-            pass
-        logger.warning(
-            "auth: failed to parse %s (%s) — starting with empty store. "
-            "Corrupt file preserved at %s",
-            auth_file, exc, corrupt_path,
+        shared_target = _shared_auth_target(auth_file)
+        recovered = (
+            _recover_shared_auth_store(shared_target)
+            if shared_target is not None
+            else None
         )
-        return {"version": AUTH_STORE_VERSION, "providers": {}}
+        if recovered is not None:
+            raw = recovered
+        else:
+            corrupt_path = auth_file.with_suffix(".json.corrupt")
+            try:
+                shutil.copy2(auth_file, corrupt_path)
+            except Exception:
+                pass
+            logger.warning(
+                "auth: failed to parse %s (%s) — starting with empty store. "
+                "Corrupt file preserved at %s",
+                auth_file, exc, corrupt_path,
+            )
+            return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     if isinstance(raw, dict) and (
         isinstance(raw.get("providers"), dict)
@@ -1127,6 +1412,11 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
     auth_file = target_path if target_path is not None else _auth_file_path()
+    with _auth_store_lock(auth_file=auth_file):
+        return _save_auth_store_unlocked(auth_store, auth_file)
+
+
+def _save_auth_store_unlocked(auth_store: Dict[str, Any], auth_file: Path) -> Path:
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
@@ -1135,6 +1425,11 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
+    shared_target = _shared_auth_target(auth_file)
+    if shared_target is not None:
+        _write_shared_auth_payload(shared_target, payload.encode("utf-8"))
+        return auth_file
+
     tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
         # Create with 0o600 atomically via os.open(O_EXCL) + fdopen to close
