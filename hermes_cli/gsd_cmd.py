@@ -28,6 +28,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Examples:\n"
             "  hermes gsd help\n"
             "  hermes gsd new-project --workspace /path/to/app\n"
+            "  hermes gsd --sandbox danger-full-access onboard --workspace /path/to/app\n"
             "  hermes gsd resume <SESSION_ID> \"<answer>\" --workspace /path/to/app"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -46,6 +47,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         metavar="PATH",
         help="Target application workspace path (default: current directory)",
+    )
+    parser.add_argument(
+        "--sandbox",
+        default="workspace-write",
+        choices=("read-only", "workspace-write", "danger-full-access"),
+        help=(
+            "Codex sandbox mode (default: workspace-write). Use "
+            "danger-full-access only when Codex bubblewrap sandboxing is "
+            "broken in the host context."
+        ),
     )
     parser.set_defaults(_gsd_parser=parser)
     return parser
@@ -67,7 +78,7 @@ def gsd_command(args: argparse.Namespace) -> int:
     try:
         from agent.transports.codex_app_server import CodexGsdRunner  # type: ignore[import-not-found]
 
-        runner = CodexGsdRunner(workspace)
+        runner = CodexGsdRunner(workspace, sandbox=getattr(args, "sandbox", "workspace-write"))
         if gsd_args[0] == "resume":
             if len(gsd_args) < 3:
                 print(

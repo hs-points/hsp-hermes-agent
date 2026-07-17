@@ -17,9 +17,10 @@ class _FakeCodexGsdRunner:
     instances: ClassVar[list["_FakeCodexGsdRunner"]] = []
     real_cls: ClassVar[Any] = None
 
-    def __init__(self, workspace):
+    def __init__(self, workspace, *, sandbox="workspace-write"):
         self.workspace = Path(workspace)
-        self._real = self.real_cls(self.workspace)
+        self.sandbox = sandbox
+        self._real = self.real_cls(self.workspace, sandbox=sandbox)
         self.calls = []
         self.instances.append(self)
 
@@ -135,4 +136,19 @@ def test_gsd_command_argv_contains_required_exec_flags(monkeypatch, tmp_path):
     assert argv[argv.index("--sandbox") + 1] == "workspace-write"
     assert argv[argv.index("-C") + 1] == str(tmp_path.resolve())
     assert argv[-1] == "$gsd-plan-phase"
+    assert not (REPO_ROOT / ".planning").exists()
+
+
+def test_gsd_allows_explicit_sandbox_override(monkeypatch, tmp_path):
+    rc, instances = _run(
+        ["--sandbox", "danger-full-access", "help", "--workspace", str(tmp_path)],
+        monkeypatch,
+    )
+
+    assert rc == 0
+    runner = instances[0]
+    assert runner.sandbox == "danger-full-access"
+    argv = runner.calls[0][2]
+    assert argv[argv.index("--sandbox") + 1] == "danger-full-access"
+    assert argv[argv.index("-C") + 1] == str(tmp_path.resolve())
     assert not (REPO_ROOT / ".planning").exists()
