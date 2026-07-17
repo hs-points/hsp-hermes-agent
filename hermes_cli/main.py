@@ -4298,6 +4298,16 @@ def cmd_project(args):
     return projects_command(args)
 
 
+def cmd_gsd(args):
+    """Run GSD Core through Codex from a target workspace."""
+    from hermes_cli.gsd_cmd import gsd_command  # type: ignore[import-not-found]
+
+    code = gsd_command(args)
+    if code:
+        sys.exit(code)
+    return code
+
+
 def cmd_hooks(args):
     """Shell-hook inspection and management."""
     from hermes_cli.hooks import hooks_command
@@ -13080,6 +13090,14 @@ def main():
 
     project_parser = _build_project_parser(subparsers)
     project_parser.set_defaults(func=cmd_project)
+
+    # =========================================================================
+    # gsd command — narrow Codex/GSD CLI entrypoint
+    # =========================================================================
+    from hermes_cli.gsd_cmd import build_parser as _build_gsd_parser  # type: ignore[import-not-found]
+
+    gsd_parser = _build_gsd_parser(subparsers)
+    gsd_parser.set_defaults(func=cmd_gsd)
 
     # =========================================================================
     # hooks command — shell-hook inspection and management

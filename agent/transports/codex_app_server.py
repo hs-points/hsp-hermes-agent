@@ -411,3 +411,181 @@ def check_codex_binary(
             f"{'.'.join(map(str, min_version))}. Run: npm i -g @openai/codex"
         )
     return True, ".".join(map(str, version))
+
+
+def parse_codex_jsonl_events(output: str) -> list[dict[str, Any]]:
+    """Parse `codex exec --json` JSONL stdout into event dicts.
+
+    Codex occasionally writes diagnostic/non-JSON lines on stderr, but stdout
+    for `--json` is line-delimited JSON. Be tolerant of blank or stray lines so
+    callers can still inspect partial event streams from failed runs.
+    """
+    events: list[dict[str, Any]] = []
+    for line in (output or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _normalize_gsd_skill_name(command: str) -> str:
+    """Return the Codex skill invocation for a GSD command.
+
+    Accepts `new-project`, `gsd-new-project`, or `$gsd-new-project` and always
+    returns `$gsd-new-project`. Slash commands are deliberately rejected because
+    Codex invokes GSD via `$`-prefixed skills.
+    """
+    raw = (command or "").strip()
+    if not raw:
+        raise ValueError("GSD command must be non-empty")
+    if raw.startswith("/"):
+        raise ValueError("Codex GSD commands must use $-prefixed skills, not slash commands")
+    if any(ch.isspace() for ch in raw):
+        raise ValueError(f"GSD command must be a single skill name, got {command!r}")
+    raw = raw.lstrip("$")
+    if not raw.startswith("gsd-"):
+        raw = f"gsd-{raw}"
+    return f"${raw}"
+
+
+@dataclass
+class CodexGsdExecResult:
+    """Result from one `codex exec --json` GSD invocation."""
+
+    returncode: int
+    command: list[str]
+    cwd: str
+    stdout: str
+    stderr: str
+    events: list[dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def from_completed_process(
+        cls,
+        proc: subprocess.CompletedProcess[str],
+        *,
+        command: list[str],
+        cwd: str,
+    ) -> "CodexGsdExecResult":
+        stdout = proc.stdout or ""
+        return cls(
+            returncode=proc.returncode,
+            command=command,
+            cwd=cwd,
+            stdout=stdout,
+            stderr=proc.stderr or "",
+            events=parse_codex_jsonl_events(stdout),
+        )
+
+    @property
+    def thread_id(self) -> Optional[str]:
+        for event in self.events:
+            if event.get("type") == "thread.started":
+                raw_thread = event.get("thread")
+                thread = raw_thread if isinstance(raw_thread, dict) else {}
+                value = event.get("thread_id") or event.get("threadId") or thread.get("id")
+                return str(value) if value else None
+        return None
+
+    @property
+    def turn_completed(self) -> bool:
+        return any(event.get("type") == "turn.completed" for event in self.events)
+
+
+class CodexGsdRunner:
+    """Reusable headless Codex CLI runner for GSD Core skills.
+
+    The runner is intentionally workspace-scoped: every invocation passes both
+    `cwd=<workspace>` to subprocess and `-C <workspace>` to Codex so GSD project
+    state is created under the target application workspace's `.planning/`, not
+    under Hermes' repo. `--sandbox workspace-write` and `-C` are repeated on
+    every start and resume command because Codex exec flags do not persist
+    across resumed turns.
+    """
+
+    def __init__(
+        self,
+        workspace: str | os.PathLike[str],
+        *,
+        codex_bin: str = "codex",
+        codex_home: Optional[str] = None,
+        sandbox: str = "workspace-write",
+        env: Optional[dict[str, str]] = None,
+        timeout: float = 600.0,
+    ) -> None:
+        self.workspace = os.path.abspath(os.fspath(workspace))
+        if not os.path.isdir(self.workspace):
+            raise FileNotFoundError(f"Codex GSD workspace does not exist: {self.workspace}")
+        self.codex_bin = codex_bin
+        self.codex_home = codex_home
+        self.sandbox = sandbox
+        self.env = dict(env or {})
+        self.timeout = timeout
+
+    def build_gsd_command(self, command: str) -> list[str]:
+        """Build argv for a non-interactive GSD skill invocation."""
+        return [
+            self.codex_bin,
+            "exec",
+            "--json",
+            "--sandbox",
+            self.sandbox,
+            "-C",
+            self.workspace,
+            _normalize_gsd_skill_name(command),
+        ]
+
+    def build_resume_command(self, session_id: str, answer: str) -> list[str]:
+        """Build argv for resuming a conversational GSD session.
+
+        `--sandbox` and `-C` are intentionally placed before the `resume`
+        subcommand: current Codex exposes them as `exec` options, not
+        resume-local options, while still applying them to the resumed turn.
+        """
+        if not session_id:
+            raise ValueError("session_id is required to resume a GSD Codex session")
+        return [
+            self.codex_bin,
+            "exec",
+            "--json",
+            "--sandbox",
+            self.sandbox,
+            "-C",
+            self.workspace,
+            "resume",
+            session_id,
+            answer,
+        ]
+
+    def run_gsd_command(self, command: str, *, timeout: Optional[float] = None) -> CodexGsdExecResult:
+        """Run one `$gsd-*` skill through `codex exec --json`."""
+        return self._run(self.build_gsd_command(command), timeout=timeout)
+
+    def resume(self, session_id: str, answer: str, *, timeout: Optional[float] = None) -> CodexGsdExecResult:
+        """Resume a conversational GSD Codex session with one answer."""
+        return self._run(self.build_resume_command(session_id, answer), timeout=timeout)
+
+    def _spawn_env(self) -> dict[str, str]:
+        spawn_env = hermes_subprocess_env(inherit_credentials=True)
+        if self.codex_home:
+            spawn_env["CODEX_HOME"] = self.codex_home
+        spawn_env.update(self.env)
+        return spawn_env
+
+    def _run(self, argv: list[str], *, timeout: Optional[float] = None) -> CodexGsdExecResult:
+        proc = subprocess.run(
+            argv,
+            cwd=self.workspace,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout if timeout is None else timeout,
+            env=self._spawn_env(),
+            stdin=subprocess.DEVNULL,
+        )
+        return CodexGsdExecResult.from_completed_process(proc, command=argv, cwd=self.workspace)
