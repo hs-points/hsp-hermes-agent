@@ -22,6 +22,7 @@ import json
 import os
 import stat
 import sys
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -200,3 +201,166 @@ def test_save_auth_store_uses_os_open_with_0o600_mode(tmp_path, monkeypatch):
             f"auth.json temp open mode 0o{mode:o} != 0o{expected:o} — "
             f"umask would apply and potentially expose tokens"
         )
+
+# ---------------------------------------------------------------------------
+# Shared symlink auth stores: cross-user lock + metadata-preserving writes.
+# ---------------------------------------------------------------------------
+
+
+def _make_shared_auth_store(tmp_path, monkeypatch):
+    home = tmp_path / "consumer-home"
+    home.mkdir()
+    shared_dir = tmp_path / "shared-auth"
+    shared_dir.mkdir()
+    shared_dir.chmod(0o2770)
+    target = shared_dir / "hermes-auth.json"
+    target.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {},
+                "credential_pool": {"openai-codex": []},
+            }
+        )
+        + "\n"
+    )
+    target.chmod(0o660)
+    auth_link = home / "auth.json"
+    auth_link.symlink_to(target)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home, auth_link, target
+
+
+def _metadata(path):
+    value = path.stat()
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_uid,
+        value.st_gid,
+        stat.S_IMODE(value.st_mode),
+    )
+
+
+def test_shared_auth_save_preserves_symlink_inode_owner_group_and_mode(
+    tmp_path, monkeypatch
+):
+    _, auth_link, target = _make_shared_auth_store(tmp_path, monkeypatch)
+    before = _metadata(target)
+
+    from hermes_cli import auth as auth_mod
+
+    saved = auth_mod._save_auth_store(
+        {
+            "version": auth_mod.AUTH_STORE_VERSION,
+            "providers": {},
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "shared",
+                        "auth_type": "oauth",
+                        "access_token": "rotated-secret",
+                    }
+                ]
+            },
+        }
+    )
+
+    assert saved == auth_link
+    assert auth_link.is_symlink()
+    assert auth_link.resolve() == target
+    assert _metadata(target) == before
+    assert json.loads(target.read_text())["credential_pool"]["openai-codex"][0][
+        "access_token"
+    ] == "rotated-secret"
+
+    journal = auth_mod._shared_auth_journal_path(target)
+    assert journal.exists()
+    assert journal.stat().st_gid == target.stat().st_gid
+    assert stat.S_IMODE(journal.stat().st_mode) == 0o660
+    assert auth_mod._auth_lock_path(auth_link) == target
+
+
+def test_shared_auth_lock_blocks_a_second_process(tmp_path, monkeypatch):
+    home, auth_link, _ = _make_shared_auth_store(tmp_path, monkeypatch)
+
+    from hermes_cli import auth as auth_mod
+
+    script = """
+from hermes_cli import auth
+try:
+    with auth._auth_store_lock(timeout_seconds=0.2):
+        print("acquired")
+except TimeoutError:
+    print("blocked")
+"""
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    with auth_mod._auth_store_lock(auth_file=auth_link):
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+
+    assert result.stdout.strip() == "blocked"
+
+
+def test_shared_auth_load_recovers_interrupted_write_without_metadata_change(
+    tmp_path, monkeypatch
+):
+    _, auth_link, target = _make_shared_auth_store(tmp_path, monkeypatch)
+
+    from hermes_cli import auth as auth_mod
+
+    expected = {
+        "version": auth_mod.AUTH_STORE_VERSION,
+        "providers": {"openai-codex": {"tokens": {"access_token": "last-good"}}},
+        "active_provider": "openai-codex",
+    }
+    payload = (json.dumps(expected, indent=2) + "\n").encode()
+    auth_mod._write_shared_auth_journal(target, payload)
+    before = _metadata(target)
+
+    # Simulate a process dying after truncation while holding the shared lock.
+    target.write_text('{"version": 1, "providers":')
+    target.chmod(before[-1])
+
+    loaded = auth_mod._load_auth_store(auth_link)
+
+    assert loaded["providers"]["openai-codex"]["tokens"]["access_token"] == "last-good"
+    assert json.loads(target.read_text()) == expected
+    assert _metadata(target) == before
+
+
+
+def test_shared_auth_save_uses_group_journal_when_target_directory_is_read_only(
+    tmp_path, monkeypatch
+):
+    _, auth_link, target = _make_shared_auth_store(tmp_path, monkeypatch)
+
+    from hermes_cli import auth as auth_mod
+
+    fallback_root = tmp_path / "var-tmp"
+    fallback_root.mkdir()
+    monkeypatch.setattr(auth_mod, "_SHARED_AUTH_JOURNAL_ROOT", fallback_root)
+    target.parent.chmod(0o2550)
+    before = _metadata(target)
+
+    auth_mod._save_auth_store(
+        {
+            "version": auth_mod.AUTH_STORE_VERSION,
+            "providers": {},
+            "credential_pool": {"openai-codex": []},
+        }
+    )
+
+    journal = auth_mod._shared_auth_journal_path(target)
+    assert journal.parent.parent == fallback_root
+    assert stat.S_IMODE(journal.parent.stat().st_mode) == 0o2770
+    assert journal.parent.stat().st_gid == target.stat().st_gid
+    assert json.loads(journal.read_text())["credential_pool"]["openai-codex"] == []
+    assert _metadata(target) == before

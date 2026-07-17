@@ -378,3 +378,107 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("HOME", "/users/alice")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("HOME") == "/users/alice"
+
+
+class TestCodexGsdRunner:
+    def test_builds_start_command_with_workspace_sandbox_and_dollar_skill(self, tmp_path):
+        from agent.transports.codex_app_server import CodexGsdRunner
+
+        runner = CodexGsdRunner(tmp_path, codex_bin="codex-test")
+
+        assert runner.build_gsd_command("new-project") == [
+            "codex-test",
+            "exec",
+            "--json",
+            "--sandbox",
+            "workspace-write",
+            "-C",
+            str(tmp_path),
+            "$gsd-new-project",
+        ]
+
+    def test_builds_resume_command_repeating_exec_flags_before_resume(self, tmp_path):
+        from agent.transports.codex_app_server import CodexGsdRunner
+
+        runner = CodexGsdRunner(tmp_path)
+
+        assert runner.build_resume_command("thread-123", "dummy answer") == [
+            "codex",
+            "exec",
+            "--json",
+            "--sandbox",
+            "workspace-write",
+            "-C",
+            str(tmp_path),
+            "resume",
+            "thread-123",
+            "dummy answer",
+        ]
+
+    def test_rejects_slash_commands(self, tmp_path):
+        from agent.transports.codex_app_server import CodexGsdRunner
+
+        runner = CodexGsdRunner(tmp_path)
+        with pytest.raises(ValueError, match="slash"):
+            runner.build_gsd_command("/gsd-new-project")
+
+    def test_parses_jsonl_thread_and_completion(self):
+        from agent.transports.codex_app_server import CodexGsdExecResult
+
+        proc = __import__("subprocess").CompletedProcess(
+            args=["codex"],
+            returncode=0,
+            stdout=(
+                '{"type":"thread.started","thread_id":"tid-1"}\n'
+                '{"type":"turn.completed","usage":{"input_tokens":1}}\n'
+            ),
+            stderr="",
+        )
+        result = CodexGsdExecResult.from_completed_process(
+            proc, command=["codex"], cwd="/tmp/workspace"
+        )
+
+        assert result.thread_id == "tid-1"
+        assert result.turn_completed is True
+        assert [event["type"] for event in result.events] == [
+            "thread.started",
+            "turn.completed",
+        ]
+
+    def test_run_uses_workspace_cwd_and_devnull_stdin(self, monkeypatch, tmp_path):
+        import subprocess
+        from agent.transports.codex_app_server import CodexGsdRunner
+
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = list(argv)
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(
+                args=argv,
+                returncode=0,
+                stdout='{"type":"thread.started","thread_id":"tid"}\n',
+                stderr="",
+            )
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        result = CodexGsdRunner(tmp_path, env={"EXTRA": "1"}).run_gsd_command(
+            "$gsd-help", timeout=12
+        )
+
+        assert captured["cwd"] == str(tmp_path)
+        assert captured["stdin"] is subprocess.DEVNULL
+        assert captured["timeout"] == 12
+        assert captured["argv"] == [
+            "codex",
+            "exec",
+            "--json",
+            "--sandbox",
+            "workspace-write",
+            "-C",
+            str(tmp_path),
+            "$gsd-help",
+        ]
+        assert captured["env"].get("EXTRA") == "1"
+        assert result.thread_id == "tid"
