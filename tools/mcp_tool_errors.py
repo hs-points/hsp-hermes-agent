@@ -143,8 +143,19 @@ def _unwrap_exception_group(exc: BaseException) -> BaseException:
             while isinstance(leaf, BaseExceptionGroup) and leaf.exceptions:
                 leaf = leaf.exceptions[0]
             raise leaf
-        exc = next((sub for sub in exc.exceptions if not _contains_only_cancellation(sub)), exc.exceptions[0])
+        # HSP: an OAuth failure among siblings is the root cause. Picking a sibling instead made the
+        # initial-connect loop retry and start a fresh OAuth flow (new ``state``) while a human was
+        # still completing the previous one ("State parameter mismatch" on `hermes mcp login`).
+        exc = next((sub for sub in exc.exceptions if _contains_auth_error(sub)), None) or next(
+            (sub for sub in exc.exceptions if not _contains_only_cancellation(sub)), exc.exceptions[0])
     return exc
+
+
+def _contains_auth_error(exc: BaseException) -> bool:
+    """True if ``exc`` is (or a group containing, at any depth) an MCP OAuth failure."""
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_contains_auth_error(sub) for sub in exc.exceptions)
+    return _is_auth_error(exc)
 
 
 def _contains_only_cancellation(exc: BaseException) -> bool:

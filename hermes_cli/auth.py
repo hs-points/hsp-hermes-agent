@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import shlex
+import stat
 import threading
 import time
 import webbrowser  # noqa: F401  (tests patch auth_mod.webbrowser.open; same module object)
@@ -720,6 +721,146 @@ def _file_lock(
                     pass
 
 
+# HSP: shared auth.json symlink support (ported from the live shared-auth fix).
+# Several profiles may symlink auth.json to one group-shared target. Saving must rewrite that
+# target in place (same inode/owner/group/mode) and every profile must lock the canonical target.
+@dataclass(frozen=True)
+class _SharedAuthTarget:
+    path: Path
+    identity: Tuple[int, int, int, int, int]
+
+
+def _auth_target_identity(file_stat: os.stat_result) -> Tuple[int, int, int, int, int]:
+    return (file_stat.st_dev, file_stat.st_ino, file_stat.st_uid, file_stat.st_gid,
+            stat.S_IMODE(file_stat.st_mode))
+
+
+def _shared_auth_target(auth_file: Path) -> Optional[_SharedAuthTarget]:
+    """Return the target and identity of an intentionally shared auth symlink."""
+    try:
+        if not auth_file.is_symlink():
+            return None
+        target = auth_file.resolve(strict=True)
+        target_stat = target.stat()
+        if not stat.S_ISREG(target_stat.st_mode):
+            return None
+        current_uid = os.geteuid() if hasattr(os, "geteuid") else target_stat.st_uid
+        if target_stat.st_uid != current_uid or target_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return _SharedAuthTarget(target, _auth_target_identity(target_stat))
+    except OSError:
+        return None
+    return None
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    written = 0
+    while written < len(view):
+        count = os.write(fd, view[written:])
+        if count <= 0:
+            raise OSError("short write while persisting shared auth store")
+        written += count
+
+
+def _lock_shared_auth_target_fd(fd: int, target: Path, timeout_seconds: Optional[float] = None) -> None:
+    """Bounded advisory flock for the shared auth target inode.
+
+    The primary cross-process lock is the target sibling ``.lock`` acquired by
+    ``_auth_store_lock``. This inner inode lock is nonblocking and bounded so external tooling
+    that locks the target file first cannot hang a Hermes writer indefinitely."""
+    if fcntl is None:
+        return
+    deadline = time.monotonic() + max(
+        0.0, AUTH_LOCK_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except (BlockingIOError, OSError, PermissionError) as exc:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for shared auth target lock: {target}") from exc
+            time.sleep(0.05)
+
+
+def _assert_shared_auth_target_path_bound(target: _SharedAuthTarget, context: str) -> None:
+    """Fail closed if the target pathname stopped naming the opened inode."""
+    try:
+        path_stat = target.path.lstat()
+    except OSError as exc:
+        raise OSError(f"shared auth target path changed {context}: {target.path}") from exc
+    if not stat.S_ISREG(path_stat.st_mode) or _auth_target_identity(path_stat) != target.identity:
+        raise OSError(f"shared auth target path changed {context}: {target.path}")
+
+
+def _write_shared_auth_payload(target: _SharedAuthTarget, payload: bytes) -> None:
+    """Rewrite a shared auth target without replacing its managed inode.
+
+    Recoverable write exceptions restore the previous payload before returning control to the
+    caller. A process crash or host power loss during the in-place write still has an inherent
+    torn-write window; preserving a managed shared inode intentionally trades atomic replacement
+    for retaining owner/group/mode and existing symlink targets."""
+    json.loads(payload.decode("utf-8"))
+    flags = os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(target.path), flags)
+    except OSError as exc:
+        raise OSError(f"shared auth target could not be opened safely: {target.path}") from exc
+    locked = False
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode):
+        os.close(fd)
+        raise OSError(f"shared auth target is not a regular file: {target.path}")
+    if _auth_target_identity(before) != target.identity:
+        os.close(fd)
+        raise OSError(f"shared auth target identity changed before write: {target.path}")
+    try:
+        if fcntl is not None:
+            _lock_shared_auth_target_fd(fd, target.path)
+            locked = True
+        _assert_shared_auth_target_path_bound(target, "after opening")
+        os.lseek(fd, 0, os.SEEK_SET)
+        current_chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            current_chunks.append(chunk)
+        current = b"".join(current_chunks)
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            _write_all(fd, payload)
+            os.ftruncate(fd, len(payload))
+            os.fsync(fd)
+        except BaseException:
+            os.lseek(fd, 0, os.SEEK_SET)
+            _write_all(fd, current)
+            os.ftruncate(fd, len(current))
+            os.fsync(fd)
+            raise
+        if _auth_target_identity(os.fstat(fd)) != target.identity:
+            raise OSError("shared auth metadata changed during in-place write")
+        _assert_shared_auth_target_path_bound(target, "after writing")
+    finally:
+        if locked and fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
+
+
+def _shared_auth_payload(auth_store: Dict[str, Any]) -> bytes:
+    """Same serialization as ``utils.atomic_json_write`` (indent=2, raw UTF-8, ASCII fallback)."""
+    try:
+        return json.dumps(auth_store, indent=2, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(auth_store, indent=2, ensure_ascii=True).encode("utf-8")
+
+
 @contextmanager
 def _auth_store_lock(
     timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS, *, target_path: Optional[Path] = None):
@@ -727,11 +868,15 @@ def _auth_store_lock(
 
     ``target_path`` is required for profile-to-global write-throughs: each path has its own
     reentrancy tracker and kernel lock. Lock ordering invariant: ``_auth_store_lock`` FIRST (outer),
-    ``_nous_shared_store_lock`` SECOND (inner), else deadlock against a concurrent shared import."""
+    ``_nous_shared_store_lock`` SECOND (inner), else deadlock against a concurrent shared import.
+    HSP: deliberately shared auth symlinks lock the canonical target, so profiles sharing one
+    store serialize refreshes and single-use OAuth refresh tokens are never consumed twice."""
     auth_path = target_path if target_path is not None else _auth_file_path()
-    lock_path = auth_path.with_suffix(".lock")
+    shared_target = _shared_auth_target(auth_path)
+    lock_target = shared_target.path if shared_target is not None else auth_path
+    lock_path = lock_target.with_suffix(".lock")
     with _file_lock(
-        lock_path, _auth_lock_holder_for(auth_path), timeout_seconds,
+        lock_path, _auth_lock_holder_for(lock_target), timeout_seconds,
         f"Timed out waiting for auth store lock ({lock_path})"):
         yield
 
@@ -803,7 +948,11 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     auth_file = target_path if target_path is not None else _auth_file_path()
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _save_private_json(auth_file, auth_store, fsync_dir=True)
+    shared_target = _shared_auth_target(auth_file)
+    if shared_target is not None:
+        _write_shared_auth_payload(shared_target, _shared_auth_payload(auth_store))
+    else:
+        _save_private_json(auth_file, auth_store, fsync_dir=True)
     if target_path is not None:
         # A write-through to the global root must not be masked by the mtime memo: on coarse-mtime
         # filesystems a read-after-write in the same tick would keep serving the pre-write store.
