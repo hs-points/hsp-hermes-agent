@@ -331,7 +331,13 @@ class SessionFtsSetupMixin:
             return False
         try:
             # Run even when the table exists: recreates triggers a no-FTS5 runtime dropped.
-            cursor.executescript(ddl)
+            # HSP: inside an open transaction/savepoint, never use executescript -- it COMMITs
+            # first, which silently ends the caller's transaction and discards its savepoint
+            # (empty-store realign then failed with "no such savepoint: fts_align_empty").
+            if getattr(cursor, "connection", cursor).in_transaction:
+                self._execute_ddl_script_transactional(cursor, ddl)
+            else:
+                cursor.executescript(ddl)
             return True
         except sqlite3.OperationalError as exc:
             if not self._is_fts5_unavailable_error(exc):
